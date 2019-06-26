@@ -1,7 +1,7 @@
 import os
+import os.path
 import hashlib
 import json
-import os
 import time
 import re
 import shutil
@@ -10,10 +10,6 @@ from textwrap import dedent
 
 import sublime
 import sublime_plugin
-
-is_ST2 = int(sublime.version()) < 3000
-
-invoke_async = sublime.set_timeout if is_ST2 else sublime.set_timeout_async
 
 
 # Use this compat method to create a dummy class
@@ -50,9 +46,9 @@ class FileHistory(with_metaclass(Singleton)):
         self.__clear_context()
 
         if self.DELETE_ALL_ON_STARTUP:
-            invoke_async(lambda: self.delete_all_history(), 0)
+            sublime.set_timeout_async(lambda: self.delete_all_history(), 0)
         elif self.CLEANUP_ON_STARTUP:
-            invoke_async(lambda: self.clean_history(False), 0)
+            sublime.set_timeout_async(lambda: self.clean_history(False), 0)
 
     def __load_settings(self):
         """Load the plugin settings from FileHistory.sublime-settings"""
@@ -104,8 +100,7 @@ class FileHistory(with_metaclass(Singleton)):
             print('[FileHistory] Invalid timstamp_format string. Falling back to default.')
             self.TIMESTAMP_FORMAT = self.DEFAULT_TIMESTAMP_FORMAT
 
-        # Ignore the file preview setting for ST2
-        self.SHOW_FILE_PREVIEW = False if is_ST2 else self.__ensure_setting('show_file_preview', True)
+        self.SHOW_FILE_PREVIEW = self.__ensure_setting('show_file_preview', True)
 
     def get_history_timestamp(self, history_entry, action):
         timestamp = None
@@ -235,7 +230,7 @@ class FileHistory(with_metaclass(Singleton)):
             json.dump(self.history, f, indent=indent)
             f.flush()
 
-        invoke_async(lambda: self.__manage_backups(), 0)
+        sublime.set_timeout_async(lambda: self.__manage_backups(), 0)
 
     def __manage_backups(self):
         # Only keep backups if the user wants them
@@ -382,10 +377,7 @@ class FileHistory(with_metaclass(Singleton)):
             for project_key in self.history:
                 # clean the project or remove it (if it no longer exists)
                 if (
-                    # The ST2 version always uses md5 hashes for the project keys,
-                    # so we can never know if a project is orphaned.
-                    is_ST2
-                    or project_key == 'global'
+                    project_key == 'global'
                     or os.path.exists(project_key)
                     or project_key in open_projects
                 ):
@@ -407,7 +399,7 @@ class FileHistory(with_metaclass(Singleton)):
         self.debug('Cleaning the "%s" history' % (project_name))
         # Only continue if this project exists
         if project_name not in self.history:
-            sublime.status_message("This project does not have any history")
+            sublime.status_message("Project has no history")
             return
 
         # Remove any non-existent files from the project
@@ -417,7 +409,7 @@ class FileHistory(with_metaclass(Singleton)):
                     self.debug('Removing non-existent file from project "%s": %s' % (project_name, node['filename']))
                     self.history[project_name][history_type].remove(node)
 
-        sublime.status_message("File history cleaned")
+        sublime.status_message("Cleaned file history")
 
     def __clear_context(self):
         """Reset the calling view variables"""
@@ -478,7 +470,7 @@ class FileHistory(with_metaclass(Singleton)):
         filepath = history_entry['filename']
         if os.path.exists(filepath):
             # asynchronously open the preview (improves perceived performance)
-            invoke_async(lambda: self.__open_preview(window, filepath), 0)
+            sublime.set_timeout_async(lambda: self.__open_preview(window, filepath), 0)
         else:
             # Close the last preview and remove the non-existent file from the history
             self.__close_preview(window)
@@ -569,9 +561,6 @@ class FileHistory(with_metaclass(Singleton)):
         self.__clear_context()
 
     def is_transient_view(self, window, view):
-        if is_ST2:
-            return False
-
         if not view:
             # Sometimes, the view is just `None`. We can't use it in this
             # state so just mark as transient.
@@ -609,10 +598,6 @@ class OpenRecentlyClosedFileEvent(sublime_plugin.EventListener):
     # otherwise it always has (-1, -1) group and index.
     def on_pre_close(self, view):
         FileHistory().add_view(sublime.active_window(), view, 'closed')
-
-    # However, ST2 does not have pre_close (and no transient views either).
-    if is_ST2:
-        on_close = on_pre_close
 
     def on_load(self, view):
         FileHistory().add_view(sublime.active_window(), view, 'opened')
@@ -724,12 +709,14 @@ class OpenRecentlyClosedFileCommand(sublime_plugin.WindowCommand):
                 selected_index = self.current_selected_index
                 # TODO recover filter text?
 
+            active_folder_paths = sublime.active_window().folders()
+
             # Prepare the display list with the file name and path separated
             display_list = []
             for key in ('closed', 'opened'):
                 for entry in self.history_list[key]:
                     filepath = entry['filename']
-                    info = [os.path.basename(filepath), os.path.dirname(filepath)]
+                    info = [shorten_path(filepath, active_folder_paths)]
 
                     # Only include the timestamp if it is there and if the user wants to see it
                     if FileHistory().TIMESTAMP_SHOW:
@@ -740,10 +727,10 @@ class OpenRecentlyClosedFileCommand(sublime_plugin.WindowCommand):
                             if not timestamp:
                                 stamp = ''
                             elif bool(FileHistory().TIMESTAMP_RELATIVE):
-                                stamp = '%s ~%s ago' % (action, self.approximate_age(timestamp))
+                                stamp = '%s %s ago' % (action, self.approximate_age(timestamp, precision=1))
                             else:
                                 stamp = '%s on %s' % (action, time.strftime(self.TIMESTAMP_FORMAT, timestamp))
-                        info.append((' ' * 6) + stamp)
+                        info.append(stamp)
 
                     display_list.append(info)
 
@@ -754,14 +741,9 @@ class OpenRecentlyClosedFileCommand(sublime_plugin.WindowCommand):
 
             self.__class__.__is_active = True
 
-            if is_ST2:
-                self.window.show_quick_panel(display_list, self.open_file, font_flag)
-            else:
-                self.window.show_quick_panel(display_list, self.open_file, font_flag,
-                                             on_highlight=self.show_preview,
-                                             selected_index=selected_index)
-            sublime.status_message("[File History] You can quick-open or remove the currently "
-                                   "selected entry with `right` and `ctrl/cmd+del` respectively.")
+            self.window.show_quick_panel(display_list, self.open_file, font_flag,
+                                         on_highlight=self.show_preview,
+                                         selected_index=selected_index)
 
         elif action == "open_latest_closed":
             self.history_list = FileHistory().get_history(current_project_only)
@@ -790,7 +772,6 @@ class OpenRecentlyClosedFileCommand(sublime_plugin.WindowCommand):
         return cls.__is_active
 
     def show_preview(self, selected_index):
-        # Note: This function will never be called in ST2
         self.current_selected_index = selected_index
         selected_entry = self.get_history_by_index(selected_index)
         if selected_entry:
@@ -843,6 +824,17 @@ class OpenRecentlyCloseFileCommandContextHandler(sublime_plugin.EventListener):
             return None
 
 
+def shorten_path(path, prefixes):
+    for prefix in prefixes:
+        r = os.path.relpath(path, prefix)
+        if not r.startswith('..'):
+            return r
+    home = os.path.expanduser("~/")
+    if path.startswith(home):
+        path = '~/' + path[len(home):]
+    return path
+
+
 def plugin_loaded():
     # Force the FileHistory singleton to be instantiated so the startup tasks will be executed
     # Depending on the "cleanup_on_startup" setting, the history may be cleaned at startup
@@ -852,9 +844,3 @@ def plugin_loaded():
 def plugin_unloaded():
     # Unregister our on_change callback
     FileHistory().app_settings.clear_on_change(FileHistory.SETTINGS_CALLBACK_KEY)
-
-# ST2 backwards (and don't call it twice in ST3)
-unload_handler = plugin_unloaded if is_ST2 else lambda: None
-
-if is_ST2:
-    plugin_loaded()
